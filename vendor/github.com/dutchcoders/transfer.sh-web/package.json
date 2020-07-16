@@ -2,7 +2,7 @@
   "name": "transfer.sh",
   "version": "0.0.0",
   "dependencies": {
-    "wiredep": "^1.8.6"
+    "wiredep": "^4.0.0"
   },
   "devDependencies": {
     "grunt": "~0.4.5",
