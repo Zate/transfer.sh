@@ -26,8 +26,10 @@ package server
 
 import (
 	"errors"
-	"fmt"
+	gorillaHandlers "github.com/gorilla/handlers"
 	"log"
+	crypto_rand "crypto/rand"
+	"encoding/binary"
 	"math/rand"
 	"mime"
 	"net/http"
@@ -60,7 +62,10 @@ import (
 const SERVER_INFO = "transfer.sh"
 
 // parse request with maximum memory of _24Kilobits
-const _24K = (1 << 10) * 24
+const _24K = (1 << 3) * 24
+
+// parse request with maximum memory of _5Megabytes
+const _5M = (1 << 20) * 5
 
 type OptionFn func(*Server)
 
@@ -79,6 +84,13 @@ func VirustotalKey(s string) OptionFn {
 func Listener(s string) OptionFn {
 	return func(srvr *Server) {
 		srvr.ListenerString = s
+	}
+
+}
+
+func CorsDomains(s string) OptionFn {
+	return func(srvr *Server) {
+		srvr.CorsDomains = s
 	}
 
 }
@@ -119,6 +131,22 @@ func WebPath(s string) OptionFn {
 	}
 }
 
+func ProxyPath(s string) OptionFn {
+	return func(srvr *Server) {
+		if s[len(s)-1:] != "/" {
+			s = s + string(filepath.Separator)
+		}
+
+		srvr.proxyPath = s
+	}
+}
+
+func ProxyPort(s string) OptionFn {
+	return func(srvr *Server) {
+		srvr.proxyPort = s
+	}
+}
+
 func TempPath(s string) OptionFn {
 	return func(srvr *Server) {
 		if s[len(s)-1:] != "/" {
@@ -129,14 +157,21 @@ func TempPath(s string) OptionFn {
 	}
 }
 
-func LogFile(s string) OptionFn {
+func LogFile(logger *log.Logger, s string) OptionFn {
 	return func(srvr *Server) {
 		f, err := os.OpenFile(s, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			log.Fatalf("error opening file: %v", err)
 		}
 
-		log.SetOutput(f)
+		logger.SetOutput(f)
+		srvr.logger = logger
+	}
+}
+
+func Logger(logger *log.Logger) OptionFn {
+	return func(srvr *Server) {
+		srvr.logger = logger
 	}
 }
 
@@ -210,9 +245,25 @@ func HttpAuthCredentials(user string, pass string) OptionFn {
 	}
 }
 
+func FilterOptions(options IPFilterOptions) OptionFn {
+	for i, allowedIP := range options.AllowedIPs {
+		options.AllowedIPs[i] = strings.TrimSpace(allowedIP)
+	}
+
+	for i, blockedIP := range options.BlockedIPs {
+		options.BlockedIPs[i] = strings.TrimSpace(blockedIP)
+	}
+
+	return func(srvr *Server) {
+		srvr.ipFilterOptions = &options
+	}
+}
+
 type Server struct {
 	AuthUser string
 	AuthPass string
+
+	logger *log.Logger
 
 	tlsConfig *tls.Config
 
@@ -226,17 +277,22 @@ type Server struct {
 
 	forceHTTPs bool
 
+	ipFilterOptions *IPFilterOptions
+
 	VirusTotalKey    string
 	ClamAVDaemonHost string
 
 	tempPath string
 
 	webPath      string
+	proxyPath    string
+	proxyPort    string
 	gaKey        string
 	userVoiceKey string
 
 	TLSListenerOnly bool
 
+	CorsDomains           string
 	ListenerString        string
 	TLSListenerString     string
 	ProfileListenerString string
@@ -259,7 +315,11 @@ func New(options ...OptionFn) (*Server, error) {
 }
 
 func init() {
-	rand.Seed(time.Now().UTC().UnixNano())
+	var seedBytes [8]byte
+	if _, err := crypto_rand.Read(seedBytes[:]); err != nil {
+		panic("cannot obtain cryptographically secure seed")
+	}
+	rand.Seed(int64(binary.LittleEndian.Uint64(seedBytes[:])))
 }
 
 func (s *Server) Run() {
@@ -269,7 +329,7 @@ func (s *Server) Run() {
 		listening = true
 
 		go func() {
-			fmt.Println("Profiled listening at: :6060")
+			s.logger.Println("Profiled listening at: :6060")
 
 			http.ListenAndServe(":6060", nil)
 		}()
@@ -280,7 +340,7 @@ func (s *Server) Run() {
 	var fs http.FileSystem
 
 	if s.webPath != "" {
-		log.Println("Using static file path: ", s.webPath)
+		s.logger.Println("Using static file path: ", s.webPath)
 
 		fs = http.Dir(s.webPath)
 
@@ -299,7 +359,7 @@ func (s *Server) Run() {
 		for _, path := range web.AssetNames() {
 			bytes, err := web.Asset(path)
 			if err != nil {
-				log.Panicf("Unable to parse: path=%s, err=%s", path, err)
+				s.logger.Panicf("Unable to parse: path=%s, err=%s", path, err)
 			}
 
 			htmlTemplates.New(stripPrefix(path)).Parse(string(bytes))
@@ -309,13 +369,15 @@ func (s *Server) Run() {
 
 	staticHandler := http.FileServer(fs)
 
-	r.PathPrefix("/images/").Handler(staticHandler)
-	r.PathPrefix("/styles/").Handler(staticHandler)
-	r.PathPrefix("/scripts/").Handler(staticHandler)
-	r.PathPrefix("/fonts/").Handler(staticHandler)
-	r.PathPrefix("/ico/").Handler(staticHandler)
-	r.PathPrefix("/favicon.ico").Handler(staticHandler)
-	r.PathPrefix("/robots.txt").Handler(staticHandler)
+	r.PathPrefix("/images/").Handler(staticHandler).Methods("GET")
+	r.PathPrefix("/styles/").Handler(staticHandler).Methods("GET")
+	r.PathPrefix("/scripts/").Handler(staticHandler).Methods("GET")
+	r.PathPrefix("/fonts/").Handler(staticHandler).Methods("GET")
+	r.PathPrefix("/ico/").Handler(staticHandler).Methods("GET")
+	r.HandleFunc("/favicon.ico", staticHandler.ServeHTTP).Methods("GET")
+	r.HandleFunc("/robots.txt", staticHandler.ServeHTTP).Methods("GET")
+
+	r.HandleFunc("/{filename:(?:favicon\\.ico|robots\\.txt|health\\.html)}", s.BasicAuthHandler(http.HandlerFunc(s.putHandler))).Methods("PUT")
 
 	r.HandleFunc("/health.html", healthHandler).Methods("GET")
 	r.HandleFunc("/", s.viewHandler).Methods("GET")
@@ -341,7 +403,7 @@ func (s *Server) Run() {
 
 		u, err := url.Parse(r.Referer())
 		if err != nil {
-			log.Fatal(err)
+			s.logger.Fatal(err)
 			return
 		}
 
@@ -371,9 +433,32 @@ func (s *Server) Run() {
 
 	mime.AddExtensionType(".md", "text/x-markdown")
 
-	log.Printf("Transfer.sh server started.\nusing temp folder: %s\nusing storage provider: %s", s.tempPath, s.storage.Type())
+	s.logger.Printf("Transfer.sh server started.\nusing temp folder: %s\nusing storage provider: %s", s.tempPath, s.storage.Type())
 
-	h := handlers.PanicHandler(handlers.LogHandler(LoveHandler(s.RedirectHandler(r)), handlers.NewLogOptions(log.Printf, "_default_")), nil)
+	var cors func(http.Handler) http.Handler
+	if len(s.CorsDomains) > 0 {
+		cors = gorillaHandlers.CORS(
+			gorillaHandlers.AllowedHeaders([]string{"*"}),
+			gorillaHandlers.AllowedOrigins(strings.Split(s.CorsDomains, ",")),
+			gorillaHandlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"}),
+		)
+	} else {
+		cors = func(h http.Handler) http.Handler {
+			return h
+		}
+	}
+
+	h := handlers.PanicHandler(
+		IPFilterHandler(
+			handlers.LogHandler(
+				LoveHandler(
+					s.RedirectHandler(cors(r))),
+				handlers.NewLogOptions(s.logger.Printf, "_default_"),
+			),
+			s.ipFilterOptions,
+		),
+		nil,
+	)
 
 	if !s.TLSListenerOnly {
 		srvr := &http.Server{
@@ -382,7 +467,7 @@ func (s *Server) Run() {
 		}
 
 		listening = true
-		log.Printf("listening on port: %v\n", s.ListenerString)
+		s.logger.Printf("listening on port: %v\n", s.ListenerString)
 
 		go func() {
 			srvr.ListenAndServe()
@@ -391,7 +476,7 @@ func (s *Server) Run() {
 
 	if s.TLSListenerString != "" {
 		listening = true
-		log.Printf("listening on port: %v\n", s.TLSListenerString)
+		s.logger.Printf("listening on port: %v\n", s.TLSListenerString)
 
 		go func() {
 			s := &http.Server{
@@ -406,7 +491,7 @@ func (s *Server) Run() {
 		}()
 	}
 
-	log.Printf("---------------------------")
+	s.logger.Printf("---------------------------")
 
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, os.Interrupt)
@@ -415,8 +500,8 @@ func (s *Server) Run() {
 	if listening {
 		<-term
 	} else {
-		log.Printf("No listener active.")
+		s.logger.Printf("No listener active.")
 	}
 
-	log.Printf("Server stopped.")
+	s.logger.Printf("Server stopped.")
 }

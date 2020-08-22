@@ -1,32 +1,31 @@
 package server
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
-	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
-	"sync"
+	"strings"
 
-	"encoding/json"
-	"github.com/goamz/goamz/s3"
-
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
-	"io/ioutil"
-	"net/http"
-	"strings"
 )
 
 type Storage interface {
-	Get(token string, filename string) (reader io.ReadCloser, contentType string, contentLength uint64, err error)
-	Head(token string, filename string) (contentType string, contentLength uint64, err error)
+	Get(token string, filename string) (reader io.ReadCloser, contentLength uint64, err error)
+	Head(token string, filename string) (contentLength uint64, err error)
 	Put(token string, filename string, reader io.Reader, contentType string, contentLength uint64) error
 	Delete(token string, filename string) error
 	IsNotExist(err error) bool
@@ -37,17 +36,18 @@ type Storage interface {
 type LocalStorage struct {
 	Storage
 	basedir string
+	logger  *log.Logger
 }
 
-func NewLocalStorage(basedir string) (*LocalStorage, error) {
-	return &LocalStorage{basedir: basedir}, nil
+func NewLocalStorage(basedir string, logger *log.Logger) (*LocalStorage, error) {
+	return &LocalStorage{basedir: basedir, logger: logger}, nil
 }
 
 func (s *LocalStorage) Type() string {
 	return "local"
 }
 
-func (s *LocalStorage) Head(token string, filename string) (contentType string, contentLength uint64, err error) {
+func (s *LocalStorage) Head(token string, filename string) (contentLength uint64, err error) {
 	path := filepath.Join(s.basedir, token, filename)
 
 	var fi os.FileInfo
@@ -57,12 +57,10 @@ func (s *LocalStorage) Head(token string, filename string) (contentType string, 
 
 	contentLength = uint64(fi.Size())
 
-	contentType = mime.TypeByExtension(filepath.Ext(filename))
-
 	return
 }
 
-func (s *LocalStorage) Get(token string, filename string) (reader io.ReadCloser, contentType string, contentLength uint64, err error) {
+func (s *LocalStorage) Get(token string, filename string) (reader io.ReadCloser, contentLength uint64, err error) {
 	path := filepath.Join(s.basedir, token, filename)
 
 	// content type , content length
@@ -76,8 +74,6 @@ func (s *LocalStorage) Get(token string, filename string) (reader io.ReadCloser,
 	}
 
 	contentLength = uint64(fi.Size())
-
-	contentType = mime.TypeByExtension(filepath.Ext(filename))
 
 	return
 }
@@ -105,12 +101,11 @@ func (s *LocalStorage) Put(token string, filename string, reader io.Reader, cont
 
 	path := filepath.Join(s.basedir, token)
 
-	if err = os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
+	if err = os.MkdirAll(path, 0700); err != nil && !os.IsExist(err) {
 		return err
 	}
 
 	if f, err = os.OpenFile(filepath.Join(path, filename), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600); err != nil {
-		fmt.Printf("%s", err)
 		return err
 	}
 
@@ -125,36 +120,39 @@ func (s *LocalStorage) Put(token string, filename string, reader io.Reader, cont
 
 type S3Storage struct {
 	Storage
-	bucket *s3.Bucket
+	bucket      string
+	session     *session.Session
+	s3          *s3.S3
+	logger      *log.Logger
+	noMultipart bool
 }
 
-func NewS3Storage(accessKey, secretKey, bucketName, endpoint string) (*S3Storage, error) {
-	bucket, err := getBucket(accessKey, secretKey, bucketName, endpoint)
-	if err != nil {
-		return nil, err
-	}
+func NewS3Storage(accessKey, secretKey, bucketName, region, endpoint string, logger *log.Logger, disableMultipart bool, forcePathStyle bool) (*S3Storage, error) {
+	sess := getAwsSession(accessKey, secretKey, region, endpoint, forcePathStyle)
 
-	return &S3Storage{bucket: bucket}, nil
+	return &S3Storage{bucket: bucketName, s3: s3.New(sess), session: sess, logger: logger, noMultipart: disableMultipart}, nil
 }
 
 func (s *S3Storage) Type() string {
 	return "s3"
 }
 
-func (s *S3Storage) Head(token string, filename string) (contentType string, contentLength uint64, err error) {
+func (s *S3Storage) Head(token string, filename string) (contentLength uint64, err error) {
 	key := fmt.Sprintf("%s/%s", token, filename)
 
+	headRequest := &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}
+
 	// content type , content length
-	response, err := s.bucket.Head(key, map[string][]string{})
+	response, err := s.s3.HeadObject(headRequest)
 	if err != nil {
 		return
 	}
 
-	contentType = response.Header.Get("Content-Type")
-
-	contentLength, err = strconv.ParseUint(response.Header.Get("Content-Length"), 10, 0)
-	if err != nil {
-		return
+	if response.ContentLength != nil {
+		contentLength = uint64(*response.ContentLength)
 	}
 
 	return
@@ -165,26 +163,31 @@ func (s *S3Storage) IsNotExist(err error) bool {
 		return false
 	}
 
-	log.Printf("IsNotExist: %s, %#v", err.Error(), err)
+	if aerr, ok := err.(awserr.Error); ok {
+		switch aerr.Code() {
+		case s3.ErrCodeNoSuchKey:
+			return true
+		}
+	}
 
-	b := (err.Error() == "The specified key does not exist.")
-	b = b || (err.Error() == "Access Denied")
-	return b
+	return false
 }
 
-func (s *S3Storage) Get(token string, filename string) (reader io.ReadCloser, contentType string, contentLength uint64, err error) {
+func (s *S3Storage) Get(token string, filename string) (reader io.ReadCloser, contentLength uint64, err error) {
 	key := fmt.Sprintf("%s/%s", token, filename)
 
-	// content type , content length
-	response, err := s.bucket.GetResponse(key)
+	getRequest := &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}
+
+	response, err := s.s3.GetObject(getRequest)
 	if err != nil {
 		return
 	}
 
-	contentType = response.Header.Get("Content-Type")
-	contentLength, err = strconv.ParseUint(response.Header.Get("Content-Length"), 10, 0)
-	if err != nil {
-		return
+	if response.ContentLength != nil {
+		contentLength = uint64(*response.ContentLength)
 	}
 
 	reader = response.Body
@@ -193,10 +196,23 @@ func (s *S3Storage) Get(token string, filename string) (reader io.ReadCloser, co
 
 func (s *S3Storage) Delete(token string, filename string) (err error) {
 	metadata := fmt.Sprintf("%s/%s.metadata", token, filename)
-	s.bucket.Del(metadata)
+	deleteRequest := &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(metadata),
+	}
+
+	_, err = s.s3.DeleteObject(deleteRequest)
+	if err != nil {
+		return
+	}
 
 	key := fmt.Sprintf("%s/%s", token, filename)
-	err = s.bucket.Del(key)
+	deleteRequest = &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}
+
+	_, err = s.s3.DeleteObject(deleteRequest)
 
 	return
 }
@@ -204,113 +220,25 @@ func (s *S3Storage) Delete(token string, filename string) (err error) {
 func (s *S3Storage) Put(token string, filename string, reader io.Reader, contentType string, contentLength uint64) (err error) {
 	key := fmt.Sprintf("%s/%s", token, filename)
 
-	var (
-		multi *s3.Multi
-		parts []s3.Part
-	)
-
-	if multi, err = s.bucket.InitMulti(key, contentType, s3.Private); err != nil {
-		log.Printf(err.Error())
-		return
+	s.logger.Printf("Uploading file %s to S3 Bucket", filename)
+	var concurrency int
+	if !s.noMultipart {
+		concurrency = 20
+	} else {
+		concurrency = 1
 	}
 
-	// 20 mb parts
-	partsChan := make(chan interface{})
-	// partsChan := make(chan s3.Part)
+	// Create an uploader with the session and custom options
+	uploader := s3manager.NewUploader(s.session, func(u *s3manager.Uploader) {
+		u.Concurrency = concurrency // default is 5
+		u.LeavePartsOnError = false
+	})
 
-	go func() {
-		// maximize to 20 threads
-		sem := make(chan int, 20)
-		index := 1
-		var wg sync.WaitGroup
-
-		for {
-			// buffered in memory because goamz s3 multi needs seekable reader
-			var (
-				buffer []byte = make([]byte, (1<<20)*10)
-				count  int
-				err    error
-			)
-
-			// Amazon expects parts of at least 5MB, except for the last one
-			if count, err = io.ReadAtLeast(reader, buffer, (1<<20)*5); err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-				log.Printf(err.Error())
-				return
-			}
-
-			// always send minimal 1 part
-			if err == io.EOF && index > 1 {
-				log.Printf("Waiting for all parts to finish uploading.")
-
-				// wait for all parts to be finished uploading
-				wg.Wait()
-
-				// and close the channel
-				close(partsChan)
-
-				return
-			}
-
-			wg.Add(1)
-
-			sem <- 1
-
-			// using goroutines because of retries when upload fails
-			go func(multi *s3.Multi, buffer []byte, index int) {
-				log.Printf("Uploading part %d %d", index, len(buffer))
-
-				defer func() {
-					log.Printf("Finished part %d %d", index, len(buffer))
-
-					wg.Done()
-
-					<-sem
-				}()
-
-				partReader := bytes.NewReader(buffer)
-
-				var part s3.Part
-
-				if part, err = multi.PutPart(index, partReader); err != nil {
-					log.Printf("Error while uploading part %d %d %s", index, len(buffer), err.Error())
-					partsChan <- err
-					return
-				}
-
-				log.Printf("Finished uploading part %d %d", index, len(buffer))
-
-				partsChan <- part
-
-			}(multi, buffer[:count], index)
-
-			index++
-		}
-	}()
-
-	// wait for all parts to be uploaded
-	for part := range partsChan {
-		switch part.(type) {
-		case s3.Part:
-			parts = append(parts, part.(s3.Part))
-		case error:
-			// abort multi upload
-			log.Printf("Error during upload, aborting %s.", part.(error).Error())
-			err = part.(error)
-
-			multi.Abort()
-			return
-		}
-
-	}
-
-	log.Printf("Completing upload %d parts", len(parts))
-
-	if err = multi.Complete(parts); err != nil {
-		log.Printf("Error during completing upload %d parts %s", len(parts), err.Error())
-		return
-	}
-
-	log.Printf("Completed uploading %d", len(parts))
+	_, err = uploader.Upload(&s3manager.UploadInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   reader,
+	})
 
 	return
 }
@@ -320,9 +248,11 @@ type GDrive struct {
 	rootId          string
 	basedir         string
 	localConfigPath string
+	chunkSize       int
+	logger          *log.Logger
 }
 
-func NewGDriveStorage(clientJsonFilepath string, localConfigPath string, basedir string) (*GDrive, error) {
+func NewGDriveStorage(clientJsonFilepath string, localConfigPath string, basedir string, chunkSize int, logger *log.Logger) (*GDrive, error) {
 	b, err := ioutil.ReadFile(clientJsonFilepath)
 	if err != nil {
 		return nil, err
@@ -334,12 +264,13 @@ func NewGDriveStorage(clientJsonFilepath string, localConfigPath string, basedir
 		return nil, err
 	}
 
-	srv, err := drive.New(getGDriveClient(config))
+	srv, err := drive.New(getGDriveClient(config, localConfigPath, logger))
 	if err != nil {
 		return nil, err
 	}
 
-	storage := &GDrive{service: srv, basedir: basedir, rootId: "", localConfigPath: localConfigPath}
+	chunkSize = chunkSize * 1024 * 1024
+	storage := &GDrive{service: srv, basedir: basedir, rootId: "", localConfigPath: localConfigPath, chunkSize: chunkSize, logger: logger}
 	err = storage.setupRoot()
 	if err != nil {
 		return nil, err
@@ -349,6 +280,7 @@ func NewGDriveStorage(clientJsonFilepath string, localConfigPath string, basedir
 }
 
 const GDriveRootConfigFile = "root_id.conf"
+const GDriveTokenJsonFile = "token.json"
 const GDriveDirectoryMimeType = "application/vnd.google-apps.folder"
 
 func (s *GDrive) setupRoot() error {
@@ -399,11 +331,11 @@ func (s *GDrive) findId(filename string, token string) (string, error) {
 
 	q := fmt.Sprintf("'%s' in parents and name='%s' and mimeType='%s' and trashed=false", s.rootId, token, GDriveDirectoryMimeType)
 	l, err := s.list(nextPageToken, q)
-	for 0 < len(l.Files) {
-		if err != nil {
-			return "", err
-		}
+	if err != nil {
+		return "", err
+	}
 
+	for 0 < len(l.Files) {
 		for _, fi := range l.Files {
 			tokenId = fi.Id
 			break
@@ -424,12 +356,11 @@ func (s *GDrive) findId(filename string, token string) (string, error) {
 
 	q = fmt.Sprintf("'%s' in parents and name='%s' and mimeType!='%s' and trashed=false", tokenId, filename, GDriveDirectoryMimeType)
 	l, err = s.list(nextPageToken, q)
+	if err != nil {
+		return "", err
+	}
 
 	for 0 < len(l.Files) {
-		if err != nil {
-			return "", err
-		}
-
 		for _, fi := range l.Files {
 
 			fileId = fi.Id
@@ -454,7 +385,7 @@ func (s *GDrive) Type() string {
 	return "gdrive"
 }
 
-func (s *GDrive) Head(token string, filename string) (contentType string, contentLength uint64, err error) {
+func (s *GDrive) Head(token string, filename string) (contentLength uint64, err error) {
 	var fileId string
 	fileId, err = s.findId(filename, token)
 	if err != nil {
@@ -462,18 +393,16 @@ func (s *GDrive) Head(token string, filename string) (contentType string, conten
 	}
 
 	var fi *drive.File
-	if fi, err = s.service.Files.Get(fileId).Fields("mimeType", "size").Do(); err != nil {
+	if fi, err = s.service.Files.Get(fileId).Fields("size").Do(); err != nil {
 		return
 	}
 
 	contentLength = uint64(fi.Size)
 
-	contentType = fi.MimeType
-
 	return
 }
 
-func (s *GDrive) Get(token string, filename string) (reader io.ReadCloser, contentType string, contentLength uint64, err error) {
+func (s *GDrive) Get(token string, filename string) (reader io.ReadCloser, contentLength uint64, err error) {
 	var fileId string
 	fileId, err = s.findId(filename, token)
 	if err != nil {
@@ -481,14 +410,13 @@ func (s *GDrive) Get(token string, filename string) (reader io.ReadCloser, conte
 	}
 
 	var fi *drive.File
-	fi, err = s.service.Files.Get(fileId).Fields("mimeType", "size", "md5Checksum").Do()
+	fi, err = s.service.Files.Get(fileId).Fields("size", "md5Checksum").Do()
 	if !s.hasChecksum(fi) {
 		err = fmt.Errorf("Cannot find file %s/%s", token, filename)
 		return
 	}
 
 	contentLength = uint64(fi.Size)
-	contentType = fi.MimeType
 
 	ctx := context.Background()
 	var res *http.Response
@@ -517,10 +445,6 @@ func (s *GDrive) Delete(token string, filename string) (err error) {
 }
 
 func (s *GDrive) IsNotExist(err error) bool {
-	if err == nil {
-		return false
-	}
-
 	if err != nil {
 		if e, ok := err.(*googleapi.Error); ok {
 			return e.Code == http.StatusNotFound
@@ -559,7 +483,7 @@ func (s *GDrive) Put(token string, filename string, reader io.Reader, contentTyp
 	}
 
 	ctx := context.Background()
-	_, err = s.service.Files.Create(dst).Context(ctx).Media(reader).Do()
+	_, err = s.service.Files.Create(dst).Context(ctx).Media(reader, googleapi.ChunkSize(s.chunkSize)).Do()
 
 	if err != nil {
 		return err
@@ -569,30 +493,31 @@ func (s *GDrive) Put(token string, filename string, reader io.Reader, contentTyp
 }
 
 // Retrieve a token, saves the token, then returns the generated client.
-func getGDriveClient(config *oauth2.Config) *http.Client {
-	tokenFile := "token.json"
+func getGDriveClient(config *oauth2.Config, localConfigPath string, logger *log.Logger) *http.Client {
+	tokenFile := filepath.Join(localConfigPath, GDriveTokenJsonFile)
 	tok, err := gDriveTokenFromFile(tokenFile)
 	if err != nil {
-		tok = getGDriveTokenFromWeb(config)
-		saveGDriveToken(tokenFile, tok)
+		tok = getGDriveTokenFromWeb(config, logger)
+		saveGDriveToken(tokenFile, tok, logger)
 	}
+
 	return config.Client(context.Background(), tok)
 }
 
 // Request a token from the web, then returns the retrieved token.
-func getGDriveTokenFromWeb(config *oauth2.Config) *oauth2.Token {
+func getGDriveTokenFromWeb(config *oauth2.Config, logger *log.Logger) *oauth2.Token {
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 	fmt.Printf("Go to the following link in your browser then type the "+
 		"authorization code: \n%v\n", authURL)
 
 	var authCode string
 	if _, err := fmt.Scan(&authCode); err != nil {
-		log.Fatalf("Unable to read authorization code %v", err)
+		logger.Fatalf("Unable to read authorization code %v", err)
 	}
 
-	tok, err := config.Exchange(oauth2.NoContext, authCode)
+	tok, err := config.Exchange(context.TODO(), authCode)
 	if err != nil {
-		log.Fatalf("Unable to retrieve token from web %v", err)
+		logger.Fatalf("Unable to retrieve token from web %v", err)
 	}
 	return tok
 }
@@ -610,12 +535,13 @@ func gDriveTokenFromFile(file string) (*oauth2.Token, error) {
 }
 
 // Saves a token to a file path.
-func saveGDriveToken(path string, token *oauth2.Token) {
-	fmt.Printf("Saving credential file to: %s\n", path)
+func saveGDriveToken(path string, token *oauth2.Token, logger *log.Logger) {
+	logger.Printf("Saving credential file to: %s\n", path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	defer f.Close()
 	if err != nil {
-		log.Fatalf("Unable to cache oauth token: %v", err)
+		logger.Fatalf("Unable to cache oauth token: %v", err)
 	}
+
 	json.NewEncoder(f).Encode(token)
 }
